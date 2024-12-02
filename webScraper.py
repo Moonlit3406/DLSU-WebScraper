@@ -1,18 +1,23 @@
+from bs4 import BeautifulSoup
 import requests
+import requests.exceptions
+import urllib.parse
+from collections import deque
 import re
 import csv
 import time
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-from collections import deque
 import argparse
+from urllib.parse import urljoin
 
-# Regex for DLSU emails
-email_regex = re.compile(r'[A-Za-z0-9._%+-]+@dlsu\.edu\.ph')
+# Function to decode Cloudflare obfuscated email addresses
+def cfDecodeEmail(encodedString):
+    r = int(encodedString[:2], 16)
+    email = ''.join([chr(int(encodedString[i:i+2], 16) ^ r) for i in range(2, len(encodedString), 2)])
+    return email
 
 # Globals
 crawled_urls = set()  # Set of already crawled URLs
-emails_found = {}  # Dictionary to store emails and associated details
+emails_found = set()  # Set to store found emails
 start_time = None  # Start time for time-limited scraping
 
 def fetch_url(url):
@@ -26,26 +31,18 @@ def fetch_url(url):
         print(f"Error fetching {url}: {e}")
         return None
 
-def scrape_emails(soup):
+def scrape_emails(soup, page_title, url):
+    """Scrapes emails and adds them to the set with associated data."""
     global emails_found
-    emails = soup.find_all(string=email_regex)
-    for email in emails:
-        email = email.strip()  # Clean up the email string
-        parent_tag = soup.find(string=email)
-        if parent_tag and parent_tag.parent:  # Ensure parent exists
-            parent = parent_tag.parent
-            name = ""
-            office = ""
-            department = ""
+    # Extract Cloudflare obfuscated emails
+    obfuscated_emails = set(re.findall(r'data-cfemail="(.*?)"', str(soup)))
+    for encoded_email in obfuscated_emails:
+        try:
+            decoded_email = cfDecodeEmail(encoded_email)
+            emails_found.add((decoded_email, url, page_title))
+        except Exception as e:
+            print(f"[-] Failed to decode email: {encoded_email}. Error: {e}")
 
-            # Extract relevant information from sibling or parent elements
-            if parent.name == 'a':  # If the email is part of a link
-                name = parent.get_text(strip=True)
-            elif parent.find_previous() and parent.find_previous().name in ['p', 'div', 'span']:
-                name = parent.find_previous().get_text(strip=True)
-
-            # Store email with associated data
-            emails_found.add((email, name, office, department))
 
 def extract_links(soup, base_url):
     """Extracts and returns valid links from a BeautifulSoup object."""
@@ -61,46 +58,49 @@ def extract_links(soup, base_url):
             links.add(absolute_url)
     return links
 
-def crawl(start_url, time_limit, max_nodes):
+def crawl(start_url, time_limit):
     """Performs a time-limited crawl starting from the given URL."""
     global start_time
     start_time = time.time()
-    queue = deque([(start_url, 0)])  # (url, node count)
-    node_count = 0
+    queue = deque([start_url])  # Queue for BFS
+    page_count = 0
 
     while queue and (time.time() - start_time) < time_limit * 60:
-        current_url, depth = queue.popleft()
-        if node_count >= max_nodes:
-            break
+        current_url = queue.popleft()
+        if current_url in crawled_urls:
+            continue
 
         response = fetch_url(current_url)
         if not response:
             continue
 
         soup = BeautifulSoup(response.content, 'html.parser')
+        page_title = soup.title.string.strip() if soup.title else "No Title"
 
         # Scrape emails and add links to queue
-        scrape_emails(soup)
+        scrape_emails(soup, page_title, current_url)
         new_links = extract_links(soup, start_url)
-        queue.extend((link, depth + 1) for link in new_links)
+        queue.extend(new_links)
 
         # Mark the URL as crawled
         crawled_urls.add(current_url)
-        node_count += 1
+        page_count += 1
+
+    return page_count
 
 def save_emails_to_csv(output_file):
     with open(output_file, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
-        writer.writerow(['Email', 'Name', 'Office', 'Department'])  # Header
-        for email, name, office, department in emails_found:
-            writer.writerow([email, name, office, department])
+        writer.writerow(['Email', 'Source URL', 'Webpage Title'])  # Header
+        for email, source_url, page_title in emails_found:
+            writer.writerow([email, source_url, page_title])
 
-def save_statistics_to_file(stats_file):
+def save_statistics_to_file(stats_file, page_count):
     """Saves statistics of the web scraping process to a text file."""
     elapsed_time = time.time() - start_time
     with open(stats_file, 'w', encoding='utf-8') as file:
-        file.write(f"Total URLs crawled: {len(crawled_urls)}\n")
-        file.write(f"Total emails found: {len(emails_found)}\n")
+        file.write(f"Total Pages Crawled: {page_count}\n")
+        file.write(f"Total Emails Found: {len(emails_found)}\n")
         file.write(f"Time taken: {elapsed_time:.2f} seconds\n")
 
 def main():
@@ -108,17 +108,16 @@ def main():
     parser = argparse.ArgumentParser(description="Email web scraper with time limit.")
     parser.add_argument("url", help="URL of the website to scrape")
     parser.add_argument("time_limit", type=int, help="Scraping time limit in minutes")
-    parser.add_argument("max_nodes", type=int, help="Maximum number of nodes to scrape")
     parser.add_argument("--output_emails", default="emails.csv", help="Output CSV file for emails")
     parser.add_argument("--output_stats", default="stats.txt", help="Output text file for statistics")
     args = parser.parse_args()
 
     # Start crawling
-    crawl(args.url, args.time_limit, args.max_nodes)
+    page_count = crawl(args.url, args.time_limit)
 
     # Save results
     save_emails_to_csv(args.output_emails)
-    save_statistics_to_file(args.output_stats)
+    save_statistics_to_file(args.output_stats, page_count)
 
     print(f"\n=== Results ===")
     print(f"Emails saved to: {args.output_emails}")
